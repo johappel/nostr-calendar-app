@@ -22,6 +22,9 @@ class NostrCalendarPublisher {
         error_log('[Nostr Calendar] Publishing event: ' . print_r($event_data, true));
         error_log('[Nostr Calendar] Using identity: ' . print_r($calendar_identity, true));
         try {
+            // CRITICAL FIX: Add pubkey BEFORE delegation validation
+            $event_data['pubkey'] = $calendar_identity['pubkey'];
+            
             // Use delegation manager to add delegation tag if configured
             global $nostr_calendar_delegation_manager;
             if ($nostr_calendar_delegation_manager) {
