@@ -515,7 +515,7 @@ async connectBunker(connectURI, { openAuth = true } = {}) {
 
 
 
-  // ---- Event-Vorlage (Kind 31923)
+  // ---- Event-Vorlage (Kind 31923) mit Delegation-Unterstützung
   toEventTemplate(data) {
     const tags = [
       ['title', data.title],
@@ -527,6 +527,13 @@ async connectBunker(connectURI, { openAuth = true } = {}) {
     if (data.location) tags.push(['location', data.location]);
     if (data.image) tags.push(['image', data.image]);
     for (const t of (data.tags || [])) { const v = String(t).trim(); if (v) tags.push(['t', v]); }
+    
+    // KRITISCH: Delegation-Tag hinzufügen falls vorhanden
+    if (data.delegationTag && Array.isArray(data.delegationTag)) {
+      console.log('[NostrClient] Adding delegation tag to event template:', data.delegationTag);
+      tags.push(data.delegationTag);
+    }
+    
     const d = data.d || b64((data.url || '') + '|' + data.title + '|' + data.start);
     tags.push(['d', d]);
     if (Array.isArray(Config.appTag)) tags.push(Config.appTag);
@@ -800,11 +807,11 @@ async connectBunker(connectURI, { openAuth = true } = {}) {
       // Event validieren: entweder direkter Author oder gültige Delegation
       let isValid = false;
       
-      console.log('[Delegation] DEBUG: Checking event:', event.id, 'author:', event.pubkey);
+      // console.log('[Delegation] DEBUG: Checking event:', event.id, 'author:', event.pubkey);
       
       // 1. Direkter Author check
       if (!allowedAuthors.length || allowedAuthors.includes(event.pubkey)) {
-        console.log('[Delegation] DEBUG: Direct author match for event:', event.id);
+        // console.log('[Delegation] DEBUG: Direct author match for event:', event.id);
         isValid = true;
       } else {
         console.log('[Delegation] DEBUG: No direct author match, checking delegation for event:', event.id);
@@ -852,7 +859,7 @@ async connectBunker(connectURI, { openAuth = true } = {}) {
       }
       
       if (isValid) {
-        console.log('[Delegation] DEBUG: Event accepted:', event.id);
+        // console.log('[Delegation] DEBUG: Event accepted:', event.id);
         latest.set(d, event);
       } else {
         console.log('[Delegation] DEBUG: Event rejected:', event.id);

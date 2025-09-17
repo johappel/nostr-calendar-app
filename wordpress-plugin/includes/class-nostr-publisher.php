@@ -16,28 +16,17 @@ class NostrCalendarPublisher {
     }
     
     /**
-     * Publish event to Nostr relays
+     * Publish already signed event to Nostr relays
      */
-    public function publish_event($event_data, $calendar_identity) {
-        error_log('[Nostr Calendar] Publishing event: ' . print_r($event_data, true));
-        error_log('[Nostr Calendar] Using identity: ' . print_r($calendar_identity, true));
+    public function publish_event($signed_event) {
+        error_log('[Nostr Calendar] Publishing signed event: ' . print_r($signed_event, true));
+        
         try {
-            // CRITICAL FIX: Add pubkey BEFORE delegation validation
-            $event_data['pubkey'] = $calendar_identity['pubkey'];
-            
-            // Use delegation manager to add delegation tag if configured
-            global $nostr_calendar_delegation_manager;
-            if ($nostr_calendar_delegation_manager) {
-                $event_data = $nostr_calendar_delegation_manager->add_delegation_tag_to_event($event_data);
-            }
-
-            // Sign the event
-            $signed_event = $this->sign_event($event_data, $calendar_identity);
-            
-            if (!$signed_event) {
+            // Validate the signed event structure
+            if (!$this->validate_event($signed_event)) {
                 return [
                     'success' => false,
-                    'errors' => ['Failed to sign event']
+                    'errors' => ['Invalid event structure']
                 ];
             }
             
@@ -59,98 +48,6 @@ class NostrCalendarPublisher {
         }
     }
 
-    /**
-     * Sign Nostr event using secp256k1
-     */
-    private function sign_event($event_data, $calendar_identity) {
-        try {
-            // Prepare event for signing
-            $event = [
-                'id' => '',
-                'pubkey' => $calendar_identity['pubkey'],
-                'created_at' => $event_data['created_at'],
-                'kind' => $event_data['kind'],
-                'tags' => $event_data['tags'],
-                'content' => $event_data['content'],
-                'sig' => ''
-            ];
-            
-            // Create event ID
-            $event['id'] = $this->calculate_event_id($event);
-            
-            // Sign the event
-            $event['sig'] = $this->sign_event_id($event['id'], $calendar_identity['private_key']);
-            
-            return $event;
-            
-        } catch (Exception $e) {
-            error_log('Nostr Calendar: Event signing failed: ' . $e->getMessage());
-            return false;
-        }
-    }
-    
-    /**
-     * Calculate Nostr event ID (SHA256 hash)
-     */
-    private function calculate_event_id($event) {
-        return NostrSimpleCrypto::calculate_event_id($event);
-    }
-    
-    /**
-     * Sign event ID with private key using secp256k1
-     */
-    private function sign_event_id($event_id, $private_key) {
-        // Try proper crypto libraries first if available
-        if (NostrSimpleCrypto::has_proper_crypto()) {
-            
-            // kornrunner/secp256k1 library v0.3.0
-            if (class_exists('kornrunner\Secp256k1')) {
-                try {
-                    $secp256k1 = new \kornrunner\Secp256k1();
-                    $signature = $secp256k1->sign(hex2bin($event_id), hex2bin($private_key));
-                    return bin2hex($signature);
-                } catch (Exception $e) {
-                    error_log('Nostr Calendar: kornrunner signing failed: ' . $e->getMessage());
-                }
-            }
-            
-            // simplito/elliptic-php library
-            if (class_exists('Elliptic\EC')) {
-                try {
-                    $ec = new \Elliptic\EC('secp256k1');
-                    $key = $ec->keyFromPrivate($private_key, 'hex');
-                    $signature = $key->sign(hex2bin($event_id));
-                    return $signature->toDER('hex');
-                } catch (Exception $e) {
-                    error_log('Nostr Calendar: elliptic-php signing failed: ' . $e->getMessage());
-                }
-            }
-            
-            // Native PHP secp256k1 extension (if available)
-            if (function_exists('secp256k1_sign')) {
-                try {
-                    $signature = secp256k1_sign(hex2bin($event_id), hex2bin($private_key));
-                    return bin2hex($signature);
-                } catch (Exception $e) {
-                    error_log('Nostr Calendar: native secp256k1 signing failed: ' . $e->getMessage());
-                }
-            }
-        }
-        
-        // Fallback to simplified signing (for development/demo)
-        error_log('Nostr Calendar: Using simplified signing fallback (not production-ready)');
-        return NostrSimpleCrypto::sign_event($event_id, $private_key);
-    }
-    
-    /**
-     * Fallback signing method using OpenSSL (simplified)
-     */
-    private function sign_with_openssl($event_id, $private_key) {
-        // This is a simplified fallback - in production you'd want proper secp256k1
-        $signature = hash_hmac('sha256', $event_id, $private_key);
-        return $signature . '01'; // Add recovery flag
-    }
-    
     /**
      * Publish event to multiple Nostr relays
      */
@@ -178,59 +75,202 @@ class NostrCalendarPublisher {
     }
     
     /**
-     * Publish to single relay using WebSocket
+     * Publish to single relay (updated to use improved websocket send and return reason)
      */
     private function publish_to_relay($event, $relay_url) {
-        // Use ReactPHP or Ratchet/Pawl for WebSocket connections
-        // For simplicity, this is a basic HTTP fallback approach
-        
-        // WebSocket message format for Nostr
-        $message = json_encode(['EVENT', $event]);
-        
-        // In a real implementation, you'd use:
-        // - ReactPHP WebSocket client
-        // - Ratchet/Pawl
-        // - Or exec a Node.js script
-        
-        return $this->send_websocket_message($relay_url, $message);
+        $message = json_encode(['EVENT', $event], JSON_UNESCAPED_SLASHES);
+        $res = $this->send_websocket_message($relay_url, $message);
+
+        if (is_array($res) && isset($res['success'])) {
+            if ($res['success']) {
+                error_log("Nostr Calendar: publish OK on {$relay_url} - reply: " . ($res['reply'] ?? ''));
+                return true;
+            } else {
+                error_log("Nostr Calendar: publish FAILED on {$relay_url} - reason: " . ($res['reply'] ?? 'unknown'));
+                return false;
+            }
+        }
+
+        error_log("Nostr Calendar: publish UNKNOWN result on {$relay_url}");
+        return false;
     }
-    
+
     /**
-     * Send WebSocket message (simplified implementation)
+     * Send WebSocket message (pure PHP implementation; evaluates relay replies)
+     *
+     * Returns array: ['success' => bool, 'reply' => string]
      */
     private function send_websocket_message($relay_url, $message) {
-        // For demo: Use cURL with HTTP POST to a bridge endpoint
-        // In production: Use proper WebSocket client
-        
-        // Option 1: Use exec to call Node.js WebSocket client
-        $node_script = NOSTR_CALENDAR_PLUGIN_DIR . 'scripts/publish-to-relay.js';
-        if (file_exists($node_script)) {
-            $escaped_message = escapeshellarg($message);
-            $escaped_relay = escapeshellarg($relay_url);
-            
-            $command = "node {$node_script} {$escaped_relay} {$escaped_message}";
-            $output = shell_exec($command);
-            
-            return strpos($output, 'SUCCESS') !== false;
+        $u = parse_url($relay_url);
+        if ($u === false || !isset($u['host'])) {
+            error_log("Nostr Calendar: invalid relay url {$relay_url}");
+            return ['success' => false, 'reply' => 'invalid-url'];
         }
-        
-        // Option 2: Use ReactPHP (if available)
-        if (class_exists('React\\Socket\\Connector')) {
-            return $this->send_with_reactphp($relay_url, $message);
+
+        $isSecure = (isset($u['scheme']) && strtolower($u['scheme']) === 'wss');
+        $host = $u['host'];
+        $port = isset($u['port']) ? (int)$u['port'] : ($isSecure ? 443 : 80);
+        $path = (isset($u['path']) ? $u['path'] : '/') . (isset($u['query']) ? '?' . $u['query'] : '');
+
+        $remote = ($isSecure ? 'ssl://' : '') . $host . ':' . $port;
+        $errno = 0; $errstr = '';
+        $ctx = stream_context_create();
+
+        // Open socket
+        $fp = @stream_socket_client($remote, $errno, $errstr, 5, STREAM_CLIENT_CONNECT, $ctx);
+        if (!$fp) {
+            error_log("Nostr Calendar: socket connect failed to {$relay_url} - {$errno} {$errstr}");
+            return ['success' => false, 'reply' => 'connect-failed: ' . trim("$errno $errstr")];
         }
-        
-        // Option 3: Log for manual publishing
-        error_log("Nostr Calendar: Would publish to {$relay_url}: {$message}");
-        return true; // Assume success for demo
-    }
-    
-    /**
-     * Send using ReactPHP WebSocket (if available)
-     */
-    private function send_with_reactphp($relay_url, $message) {
-        // Implementation with ReactPHP would go here
-        // This requires additional dependencies
-        return false;
+        stream_set_timeout($fp, 8);
+        stream_set_blocking($fp, true);
+
+        // WebSocket handshake
+        $key = base64_encode(random_bytes(16));
+        $hostHeader = $host . ($port && (($isSecure && $port !== 443) || (!$isSecure && $port !== 80)) ? ":{$port}" : '');
+        $headers = "GET {$path} HTTP/1.1\r\n" .
+                   "Host: {$hostHeader}\r\n" .
+                   "Upgrade: websocket\r\n" .
+                   "Connection: Upgrade\r\n" .
+                   "Sec-WebSocket-Key: {$key}\r\n" .
+                   "Sec-WebSocket-Version: 13\r\n" .
+                   "\r\n";
+        fwrite($fp, $headers);
+
+        // Read handshake response
+        $handshake = '';
+        $start = time();
+        while (!feof($fp)) {
+            $line = fgets($fp);
+            if ($line === false) break;
+            $handshake .= $line;
+            if (rtrim($line) === '') break; // end headers
+            if (time() - $start > 5) break;
+        }
+
+        if (stripos($handshake, '101') === false || stripos($handshake, 'upgrade: websocket') === false) {
+            fclose($fp);
+            error_log("Nostr Calendar: websocket handshake failed for {$relay_url} - response: " . trim($handshake));
+            return ['success' => false, 'reply' => 'handshake-failed: ' . trim($handshake)];
+        }
+
+        // helper: send masked text frame (client->server must mask)
+        $sendFrame = function($socket, $payload) {
+            $payload = (string)$payload;
+            $len = strlen($payload);
+            $b1 = 0x81; // FIN + text
+            if ($len <= 125) {
+                $head = chr($b1) . chr(0x80 | $len); // mask bit set
+            } elseif ($len <= 65535) {
+                $head = chr($b1) . chr(0x80 | 126) . pack('n', $len);
+            } else {
+                $head = chr($b1) . chr(0x80 | 127) . pack('J', $len);
+            }
+            $mask = random_bytes(4);
+            $masked = $payload ^ str_repeat($mask, (int)ceil($len / 4));
+            // apply mask properly
+            $out = $head . $mask;
+            for ($i = 0; $i < $len; $i++) {
+                $out .= $payload[$i] ^ $mask[$i % 4];
+            }
+            fwrite($socket, $out);
+        };
+
+        // helper: read a single frame (text) from server
+        $readFrame = function($socket) {
+            $b1 = ord(fread($socket, 1) ?: "\0");
+            $b2 = ord(fread($socket, 1) ?: "\0");
+            $fin = ($b1 & 0x80) !== 0;
+            $opcode = $b1 & 0x0f;
+            $masked = ($b2 & 0x80) !== 0;
+            $len = $b2 & 0x7f;
+
+            if ($len === 126) {
+                $ext = fread($socket, 2);
+                $arr = unpack('n', $ext);
+                $len = $arr[1];
+            } elseif ($len === 127) {
+                $ext = fread($socket, 8);
+                $arr = unpack('J', $ext);
+                $len = $arr[1];
+            }
+
+            $maskKey = $masked ? fread($socket, 4) : null;
+            $data = '';
+            $remaining = $len;
+            while ($remaining > 0) {
+                $chunk = fread($socket, $remaining);
+                if ($chunk === false || $chunk === '') break;
+                $data .= $chunk;
+                $remaining -= strlen($chunk);
+            }
+
+            if ($masked && $maskKey !== null) {
+                $unmasked = '';
+                for ($i = 0; $i < strlen($data); $i++) {
+                    $unmasked .= $data[$i] ^ $maskKey[$i % 4];
+                }
+                $data = $unmasked;
+            }
+
+            return ['opcode' => $opcode, 'data' => $data, 'fin' => $fin];
+        };
+
+        // send message
+        try {
+            $sendFrame($fp, $message);
+        } catch (\Throwable $e) {
+            fclose($fp);
+            error_log("Nostr Calendar: send frame failed to {$relay_url} - " . $e->getMessage());
+            return ['success' => false, 'reply' => 'send-failed: ' . $e->getMessage()];
+        }
+
+        // wait for replies until OK/NOTICE/EOSE or timeout
+        $replyText = '';
+        $deadline = time() + 8;
+        while (time() < $deadline && !feof($fp)) {
+            // stream_select for readability with timeout
+            $r = [$fp]; $w = $e = null;
+            $tv = ($deadline - time());
+            if ($tv < 0) $tv = 0;
+            $num = stream_select($r, $w, $e, $tv, 0);
+            if ($num === false) break;
+            if ($num === 0) continue;
+            $frame = $readFrame($fp);
+            if (!$frame || !isset($frame['data'])) continue;
+            $payload = trim($frame['data']);
+            $replyText .= $payload . "\n";
+
+            // try parse JSON arrays
+            $parsed = json_decode($payload, true);
+            if (is_array($parsed) && count($parsed) >= 1) {
+                $type = strtoupper($parsed[0]);
+                if ($type === 'OK') {
+                    // ["OK", "<id>", true|false, "message"]
+                    $okId = $parsed[1] ?? '';
+                    $okFlag = $parsed[2] ?? false;
+                    $okMsg = $parsed[3] ?? '';
+                    fclose($fp);
+                    if ($okFlag === true) {
+                        return ['success' => true, 'reply' => json_encode($parsed)];
+                    }
+                    return ['success' => false, 'reply' => 'ok-false: ' . $okMsg];
+                } elseif ($type === 'NOTICE') {
+                    $reason = $parsed[1] ?? '';
+                    fclose($fp);
+                    return ['success' => false, 'reply' => 'notice: ' . $reason];
+                } elseif ($type === 'EOSE') {
+                    fclose($fp);
+                    return ['success' => false, 'reply' => 'eose'];
+                } else {
+                    // other message - continue reading
+                }
+            }
+        }
+
+        // timeout / no decisive reply
+        @fclose($fp);
+        return ['success' => false, 'reply' => 'no-decisive-reply: ' . trim($replyText)];
     }
     
     /**
@@ -241,17 +281,26 @@ class NostrCalendarPublisher {
         
         foreach ($required_fields as $field) {
             if (!isset($event[$field])) {
+                error_log("Nostr Calendar: Missing field: {$field}");
                 return false;
             }
         }
         
         // Validate pubkey format (64 char hex)
         if (!preg_match('/^[0-9a-f]{64}$/i', $event['pubkey'])) {
+            error_log("Nostr Calendar: Invalid pubkey format: " . $event['pubkey']);
             return false;
         }
         
         // Validate signature format (128 char hex)
         if (!preg_match('/^[0-9a-f]{128}$/i', $event['sig'])) {
+            error_log("Nostr Calendar: Invalid signature format: " . $event['sig']);
+            return false;
+        }
+        
+        // Validate event ID format (64 char hex)
+        if (!preg_match('/^[0-9a-f]{64}$/i', $event['id'])) {
+            error_log("Nostr Calendar: Invalid event ID format: " . $event['id']);
             return false;
         }
         

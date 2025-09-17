@@ -127,6 +127,7 @@ class NostrCalendarAdminInterface {
             <div id="nostr-calendar-tabs">
                 <ul>
                     <li><a href="#tab-calendar">📅 <?php _e('Kalender', 'nostr-calendar'); ?></a></li>
+                    <li><a href="#tab-events">📝 <?php _e('Events', 'nostr-calendar'); ?></a></li>
                     <li><a href="#tab-sso">🔐 <?php _e('SSO Integration', 'nostr-calendar'); ?></a></li>
                     <li><a href="#tab-delegation">🔑 <?php _e('NIP-26 Delegationen', 'nostr-calendar'); ?></a></li>
                     <li><a href="#tab-advanced">⚙️ <?php _e('Erweitert', 'nostr-calendar'); ?></a></li>
@@ -152,6 +153,86 @@ class NostrCalendarAdminInterface {
                         
                         <?php submit_button(__('Kalender-Einstellungen speichern', 'nostr-calendar')); ?>
                     </form>
+                    
+                    <div class="identity-section">
+                        <h3><?php _e('Calendar Identity', 'nostr-calendar'); ?></h3>
+                        <div id="identity-status">
+                            <p id="current-pubkey-display"><?php _e('Keine Identität generiert', 'nostr-calendar'); ?></p>
+                            <button type="button" id="generate-identity" class="button"><?php _e('Neue Identität generieren', 'nostr-calendar'); ?></button>
+                            <button type="button" id="test-publish" class="button button-secondary"><?php _e('Testpublikation', 'nostr-calendar'); ?></button>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Events Tab -->
+                <div id="tab-events">
+                    <h2><?php _e('Event Publishing', 'nostr-calendar'); ?></h2>
+                    
+                    <div id="admin-messages"></div>
+                    
+                    <!-- CRITICAL: No method="post" to prevent GET submission -->
+                    <form id="nostr-event-form" onsubmit="return false;">
+                        <table class="form-table">
+                            <tr>
+                                <th scope="row"><?php _e('Event Title', 'nostr-calendar'); ?></th>
+                                <td>
+                                    <input type="text" name="title" required class="large-text" 
+                                           placeholder="<?php _e('Titel des Events', 'nostr-calendar'); ?>">
+                                </td>
+                            </tr>
+                            <tr>
+                                <th scope="row"><?php _e('Inhalt', 'nostr-calendar'); ?></th>
+                                <td>
+                                    <textarea name="content" rows="5" class="large-text" 
+                                              placeholder="<?php _e('Event-Beschreibung...', 'nostr-calendar'); ?>"></textarea>
+                                </td>
+                            </tr>
+                            <tr>
+                                <th scope="row"><?php _e('Start', 'nostr-calendar'); ?></th>
+                                <td>
+                                    <input type="date" name="start_date" required>
+                                    <input type="time" name="start_time" required>
+                                </td>
+                            </tr>
+                            <tr>
+                                <th scope="row"><?php _e('Ende', 'nostr-calendar'); ?></th>
+                                <td>
+                                    <input type="date" name="end_date">
+                                    <input type="time" name="end_time">
+                                </td>
+                            </tr>
+                            <tr>
+                                <th scope="row"><?php _e('Ort', 'nostr-calendar'); ?></th>
+                                <td>
+                                    <input type="text" name="location" class="large-text" 
+                                           placeholder="<?php _e('Event-Ort (optional)', 'nostr-calendar'); ?>">
+                                </td>
+                            </tr>
+                            <tr>
+                                <th scope="row"><?php _e('Kategorien', 'nostr-calendar'); ?></th>
+                                <td>
+                                    <input type="text" name="categories" class="large-text" 
+                                           placeholder="<?php _e('tag1, tag2, tag3', 'nostr-calendar'); ?>">
+                                    <p class="description"><?php _e('Komma-getrennte Liste von Hashtags', 'nostr-calendar'); ?></p>
+                                </td>
+                            </tr>
+                            <tr>
+                                <th scope="row"><?php _e('Event Kind', 'nostr-calendar'); ?></th>
+                                <td>
+                                    <select name="event_kind">
+                                        <option value="31923"><?php _e('31923 - Calendar Event (empfohlen)', 'nostr-calendar'); ?></option>
+                                        <option value="1"><?php _e('1 - Text Note', 'nostr-calendar'); ?></option>
+                                    </select>
+                                </td>
+                            </tr>
+                        </table>
+                        
+                        <p class="submit">
+                            <button type="submit" class="button button-primary"><?php _e('Event publizieren', 'nostr-calendar'); ?></button>
+                        </p>
+                    </form>
+                    
+                    <div id="publish-results" style="margin-top: 20px;"></div>
                 </div>
                 
                 <!-- SSO Tab -->
@@ -304,10 +385,29 @@ class NostrCalendarAdminInterface {
         <script>
         jQuery(document).ready(function($) {
             $('#nostr-calendar-tabs').tabs();
+            
+            // Toggle SSO fields
+            $('input[name="sso_enabled"]').change(function() {
+                $('.sso-field').toggle(this.checked);
+            });
+            
+            // Generate secret button
+            $('#generate-secret-btn').click(function() {
+                const secret = Array.from(crypto.getRandomValues(new Uint8Array(32)), 
+                    byte => byte.toString(16).padStart(2, '0')).join('');
+                $('input[name="shared_secret"]').val(secret);
+            });
         });
         </script>
         
         <style>
+        .identity-section {
+            background: #f9f9f9;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            padding: 20px;
+            margin-top: 20px;
+        }
         .sso-status {
             background: #f0f8ff;
             border: 1px solid #0073aa;
@@ -320,6 +420,28 @@ class NostrCalendarAdminInterface {
         }
         .system-info table {
             max-width: 600px;
+        }
+        #publish-results .success {
+            color: #006600;
+            background: #e6ffe6;
+            padding: 10px;
+            border-radius: 4px;
+            margin: 10px 0;
+        }
+        #publish-results .error {
+            color: #cc0000;
+            background: #ffe6e6;
+            padding: 10px;
+            border-radius: 4px;
+            margin: 10px 0;
+        }
+        #publish-results .event-id {
+            font-family: monospace;
+            background: #f5f5f5;
+            padding: 10px;
+            border-radius: 4px;
+            margin: 10px 0;
+            word-break: break-all;
         }
         </style>
         <?php

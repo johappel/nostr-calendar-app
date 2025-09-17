@@ -27,6 +27,7 @@ require_once NOSTR_CALENDAR_PLUGIN_DIR . 'includes/class-identity.php';
 require_once NOSTR_CALENDAR_PLUGIN_DIR . 'includes/class-nostr-publisher.php';
 require_once NOSTR_CALENDAR_PLUGIN_DIR . 'includes/class-simple-crypto.php';
 require_once NOSTR_CALENDAR_PLUGIN_DIR . 'includes/shortcodes.php';
+require_once NOSTR_CALENDAR_PLUGIN_DIR . 'includes/class-nostr-ajax-handler.php';
 
 // Include modular classes (to be created)
 require_once NOSTR_CALENDAR_PLUGIN_DIR . 'includes/class-admin-interface.php';
@@ -107,6 +108,11 @@ class NostrCalendarUnified {
         
         // Initialize delegation AJAX endpoints
         $this->delegation_manager->init_ajax_endpoints();
+        
+        // Initialize publisher and AJAX handler
+        global $nostr_calendar_publisher, $nostr_calendar_ajax_handler;
+        $nostr_calendar_publisher = new NostrCalendarPublisher();
+        $nostr_calendar_ajax_handler = new NostrCalendarAjaxHandler();
     }
     
     public function enqueue_scripts() {
@@ -352,3 +358,38 @@ class NostrCalendarUnified {
 
 // Initialize the plugin
 new NostrCalendarUnified();
+
+/**
+ * Enqueue admin scripts and styles
+ */
+function nostr_calendar_admin_enqueue_scripts($hook) {
+    // Only load on our plugin pages
+    if (strpos($hook, 'nostr-calendar') === false) {
+        return;
+    }
+    
+    // Enqueue nostr-tools from CDN
+    wp_enqueue_script(
+        'nostr-tools',
+        'https://unpkg.com/nostr-tools@2.5.2/lib/index.js',
+        [],
+        '2.5.2',
+        true
+    );
+    
+    // Enqueue our admin script
+    wp_enqueue_script(
+        'nostr-calendar-admin',
+        plugin_dir_url(__FILE__) . 'admin/js/admin.js',
+        ['nostr-tools'],
+        '1.0.0',
+        true
+    );
+    
+    // Localize script with AJAX data
+    wp_localize_script('nostr-calendar-admin', 'nostr_calendar_admin', [
+        'ajax_url' => admin_url('admin-ajax.php'),
+        'nonce' => wp_create_nonce('nostr_calendar_admin')
+    ]);
+}
+add_action('admin_enqueue_scripts', 'nostr_calendar_admin_enqueue_scripts');

@@ -40,6 +40,13 @@ class NostrCalendarRestAPI {
             'callback' => array($this, 'rest_create_event'),
             'permission_callback' => array($this, 'rest_permission_check')
         ));
+        
+        // NEW: Delegation private key endpoint  
+        register_rest_route('nostr-calendar/v1', '/delegation-private-key', [
+            'methods' => 'GET',
+            'callback' => [$this, 'get_delegation_private_key'],
+            'permission_callback' => [$this, 'rest_permission_check'] // Use existing method
+        ]);
     }
     
     public function rest_permission_check() {
@@ -348,4 +355,263 @@ class NostrCalendarRestAPI {
             ]);
         }
     }
+    
+    /**
+     * REST API Endpoint: Events erstellen (client-seitige Signatur)
+     */
+    public function create_event($request) {
+        try {
+            // Check if event is already signed (from admin interface)
+            $event_data = $request->get_json_params();
+            
+            if (isset($event_data['id']) && isset($event_data['sig'])) {
+                // Event is already signed - publish directly
+                return $this->publish_signed_event($event_data);
+            }
+            
+            // Event is not signed - this is the WordPress API flow
+            // We need to create the event and return it for client-side signing
+            return $this->prepare_event_for_signing($event_data, $request);
+            
+        } catch (Exception $e) {
+            return new WP_Error('create_failed', $e->getMessage(), ['status' => 500]);
+        }
+    }
+    
+    /**
+     * Prepare event data for client-side signing
+     */
+    private function prepare_event_for_signing($event_data, $request) {
+        // Get user identity
+        $user_id = get_current_user_id();
+        if (!$user_id) {
+            // Try SSO token
+            $sso_token = $request->get_param('sso_token');
+            if ($sso_token) {
+                global $nostr_calendar_sso_manager;
+                if ($nostr_calendar_sso_manager) {
+                    $sso_user = $nostr_calendar_sso_manager->validate_sso_token($sso_token);
+                    if ($sso_user) {
+                        $user_id = $sso_user['wp_user_id'];
+                    }
+                }
+            }
+        }
+        
+        if (!$user_id) {
+            return new WP_Error('unauthorized', 'Authentication required', ['status' => 401]);
+        }
+        
+        // Create event structure for Nostr
+        $event_template = [
+            'kind' => 31923, // Calendar event kind
+            'created_at' => time(),
+            'content' => $this->format_event_content($event_data),
+            'tags' => $this->build_event_tags($event_data, $user_id)
+        ];
+        
+        // Return event template for client-side signing
+        return [
+            'success' => true,
+            'event_template' => $event_template,
+            'user_id' => $user_id,
+            'message' => 'Event template created - sign on client side and send back'
+        ];
+    }
+
+    /**
+     * Format event content for Nostr event
+     */
+    private function format_event_content($event_data) {
+        $content = '';
+        
+        if (!empty($event_data['title'])) {
+            $content .= $event_data['title'] . "\n\n";
+        }
+        
+        if (!empty($event_data['description'])) {
+            $content .= $event_data['description'] . "\n\n";
+        }
+        
+        if (!empty($event_data['location'])) {
+            $content .= "📍 " . $event_data['location'] . "\n";
+        }
+        
+        if (!empty($event_data['start']) && !empty($event_data['end'])) {
+            $start_formatted = is_numeric($event_data['start']) ? 
+                date('Y-m-d H:i', $event_data['start']) : 
+                $event_data['start'];
+            $end_formatted = is_numeric($event_data['end']) ? 
+                date('Y-m-d H:i', $event_data['end']) : 
+                $event_data['end'];
+            $content .= "🕐 {$start_formatted} - {$end_formatted}\n";
+        }
+        
+        return trim($content);
+    }
+
+    /**
+     * Build event tags for Nostr event
+     */
+    private function build_event_tags($event_data, $user_id) {
+        $tags = [];
+        
+        // Required NIP-52 tags
+        if (!empty($event_data['title'])) {
+            $tags[] = ['title', sanitize_text_field($event_data['title'])];
+        }
+        
+        if (!empty($event_data['start'])) {
+            $start_timestamp = is_numeric($event_data['start']) ? 
+                $event_data['start'] : 
+                strtotime($event_data['start']);
+            $tags[] = ['start', (string)$start_timestamp];
+        }
+        
+        if (!empty($event_data['end'])) {
+            $end_timestamp = is_numeric($event_data['end']) ? 
+                $event_data['end'] : 
+                strtotime($event_data['end']);
+            $tags[] = ['end', (string)$end_timestamp];
+        }
+        
+        // Optional tags
+        if (!empty($event_data['location'])) {
+            $tags[] = ['location', sanitize_text_field($event_data['location'])];
+        }
+        
+        if (!empty($event_data['summary'])) {
+            $tags[] = ['summary', sanitize_text_field($event_data['summary'])];
+        }
+        
+        // Status tag
+        $status = !empty($event_data['status']) ? $event_data['status'] : 'planned';
+        $tags[] = ['status', sanitize_text_field($status)];
+        
+        // Categories/tags
+        if (!empty($event_data['categories'])) {
+            $categories = is_array($event_data['categories']) ? 
+                $event_data['categories'] : 
+                explode(',', $event_data['categories']);
+            
+            foreach ($categories as $category) {
+                $category = trim(sanitize_text_field($category));
+                if ($category) {
+                    $tags[] = ['t', $category];
+                }
+            }
+        }
+        
+        // Unique identifier (d tag for replaceable events)
+        $d_tag = !empty($event_data['d']) ? 
+            sanitize_text_field($event_data['d']) : 
+            'wp-event-' . time() . '-' . $user_id;
+        $tags[] = ['d', $d_tag];
+        
+        // WordPress metadata
+        $tags[] = ['wp_user_id', (string)$user_id];
+        $tags[] = ['wp_site', get_site_url()];
+        
+        // App identification
+        $tags[] = ['app', 'nostr-calendar-wordpress'];
+        
+        return $tags;
+    }
+    /**
+	 * CORRECTED: Get delegation private key for current user
+	 */
+	public function get_delegation_private_key($request) {
+		try {
+			$user_id = get_current_user_id();
+			if (!$user_id) {
+				return new WP_Error('unauthorized', 'Not authenticated', ['status' => 401]);
+			}
+			
+			// Use global delegation manager OR simple fallback
+			global $nostr_calendar_delegation_manager;
+			if ($nostr_calendar_delegation_manager && method_exists($nostr_calendar_delegation_manager, 'getDelegationPrivateKey')) {
+				$private_key = $nostr_calendar_delegation_manager->getDelegationPrivateKey($user_id);
+			} else {
+				// Simple fallback - generate deterministic private key
+				$seed = "wp-user-private-{$user_id}-" . get_site_url();
+				$private_key = hash('sha256', $seed);
+			}
+			
+			if (!$private_key) {
+				return new WP_Error('key_error', 'Could not generate delegation private key', ['status' => 500]);
+			}
+			
+			return [
+				'success' => true,
+				'private_key' => $private_key,
+				'user_id' => $user_id,
+				'message' => 'Delegation private key retrieved successfully'
+			];
+			
+		} catch (Exception $e) {
+			error_log('[NostrCalendar] Delegation private key error: ' . $e->getMessage());
+			return new WP_Error('key_error', 'Failed to get delegation private key: ' . $e->getMessage(), ['status' => 500]);
+		}
+	}
+    /**
+	 * Get current SSO user from request (helper for delegation endpoint)
+	 */
+	private function get_current_sso_user($request) {
+		// Check SSO token first
+		$sso_token = $request->get_param('sso_token');
+		
+		if ($sso_token) {
+			$user = $this->validate_sso_token($sso_token);
+			if ($user) {
+				return $user;
+			}
+		}
+		
+		// Fallback to current logged in user
+		return wp_get_current_user();
+	}
+    /**
+	 * Validate SSO token (helper for delegation endpoint)
+	 */
+	private function validate_sso_token($token) {
+		try {
+			// Parse token (format: base64_payload.signature)
+			$parts = explode('.', $token);
+			if (count($parts) !== 2) {
+				return false;
+			}
+			
+			$payload_json = base64_decode($parts[0]);
+			$payload = json_decode($payload_json, true);
+			
+			if (!$payload || !isset($payload['wp_user_id']) || !isset($payload['expires'])) {
+				return false;
+			}
+			
+			// Check if token is expired
+			if (time() > $payload['expires']) {
+				return false;
+			}
+			
+			// Get user by ID
+			$user = get_user_by('ID', $payload['wp_user_id']);
+			if (!$user) {
+				return false;
+			}
+			
+			return $user;
+			
+		} catch (Exception $e) {
+			error_log('[NostrCalendar] SSO token validation error: ' . $e->getMessage());
+			return false;
+		}
+	}
+    /**
+	 * Generate deterministic pubkey for user (must match JavaScript version)
+	 */
+	private function generateDeterministicPubkey($userId) {
+		$input = "wp-user-{$userId}-" . get_site_url();
+		return hash('sha256', $input);
+	}
+
 }

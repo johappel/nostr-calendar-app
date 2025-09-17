@@ -91,12 +91,13 @@ export class WordPressAuthPlugin extends AuthPluginInterface {
       return null;
     }
 
+    // Build base identity
     const identity = {
       pubkey: calendarIdentity?.pubkey || await this.generateDeterministicPubkey(user.id, session.site_url || session.wp_site_url),
       user: user,
       wpUser: user, // backwards compatibility
       calendarIdentity: calendarIdentity || {
-      pubkey: await this.generateDeterministicPubkey(user.id, session.site_url || session.wp_site_url),
+        pubkey: await this.generateDeterministicPubkey(user.id, session.site_url || session.wp_site_url),
         name: user.display_name || user.username,
         about: `WordPress user from ${session.site_url || session.wp_site_url}`,
         nip05: `${user.username}@${new URL(session.site_url || session.wp_site_url).hostname}`
@@ -110,7 +111,43 @@ export class WordPressAuthPlugin extends AuthPluginInterface {
         serverSidePublishing: true
       }
     };
-    console.debug('[WordPressAuth] getIdentity:', identity);
+
+    // WICHTIG: Delegation-Daten vom WordPress-Endpoint übernehmen
+    if (calendarIdentity?.delegation) {
+      console.log('[WordPressAuth] Found delegation data in calendar identity:', calendarIdentity.delegation);
+      
+      // Delegation-Informationen hinzufügen
+      identity.delegation = {
+        // Raw delegation tag (für Event-Publishing)
+        raw: calendarIdentity.delegation.raw,
+        // Parsed delegation data
+        delegatee: identity.pubkey, // Der delegierte Pubkey (WordPress User)
+        delegator: calendarIdentity.delegation.delegator, // Der delegierende Pubkey
+        conditions: calendarIdentity.delegation.conds,
+        signature: calendarIdentity.delegation.sig,
+        // Zusätzliche Metadaten
+        saved_by: calendarIdentity.delegation.saved_by,
+        saved_at: calendarIdentity.delegation.saved_at,
+        delegator_profile: calendarIdentity.delegation.delegator_profile
+      };
+
+      // Signing-Unterstützung für delegierte Identitäten
+      identity.supports.signing = true;
+      identity.supports.delegation = true;
+      
+      // Display-Name vom Delegator übernehmen falls vorhanden
+      if (calendarIdentity.delegation.delegator_profile?.name) {
+        identity.displayName = calendarIdentity.delegation.delegator_profile.name;
+      }
+
+      console.log('[WordPressAuth] Identity with delegation:', {
+        pubkey: identity.pubkey,
+        delegator: identity.delegation.delegator,
+        conditions: identity.delegation.conditions
+      });
+    }
+
+    console.debug('[WordPressAuth] getIdentity result:', identity);
     return identity;
   }
 
@@ -199,60 +236,377 @@ export class WordPressAuthPlugin extends AuthPluginInterface {
     }
 
     try {
-      // Prepare the event data for WordPress API
-      const apiEventData = {
-        title: eventData.title,
-        content: eventData.content || '',
-        start: eventData.start || eventData.start || '',
-        end: eventData.end || eventData.end || '',
-        location: eventData.location || ''
-      };
+      console.log('[WordPressAuth] Creating event using WordPress delegation without nos2x');
+      
+      // Get current identity (mit Delegation-Daten)
+      const identity = await this.getIdentity();
+      
+      // Import nostr client
+      const { client } = await import('../nostr.js');
+      
+      // WICHTIG: Bei WordPress-Delegation NICHT client.login() verwenden
+      if (identity?.delegation?.raw) {
+        console.log('[WordPressAuth] Using WordPress delegation - bypassing nostr.js login completely');
+        
+        // Prepare event data
+        const nostrEventData = {
+          title: eventData.title || '',
+          content: eventData.content || '',
+          start: this.convertToTimestamp(eventData.start),
+          end: this.convertToTimestamp(eventData.end),
+          location: eventData.location || '',
+          tags: this.parseEventTags(eventData),
+          status: 'planned',
+          summary: (eventData.content || eventData.title || '').substring(0, 100)
+        };
 
-      // Get the WordPress site URL from session
-      const wpSiteUrl = this.currentSession.site_url || this.currentSession.wp_site_url;
-      let apiUrl = `${wpSiteUrl}/wp-json/nostr-calendar/v1/events`;
-
-      // Add SSO token to request if available
-      const fetchOptions = {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(apiEventData)
-      };
-
-      // Try to use SSO token for authentication
-      const storedSession = localStorage.getItem('wp_sso_session');
-      if (storedSession) {
+        // Add delegation tag from WordPress
         try {
-          const sessionData = JSON.parse(storedSession);
-          if (sessionData.token && Date.now() / 1000 < sessionData.expires) {
-            apiUrl += `?sso_token=${encodeURIComponent(sessionData.token)}`;
+          const delegationData = JSON.parse(identity.delegation.raw);
+          if (Array.isArray(delegationData) && delegationData[0] === 'delegation') {
+            nostrEventData.delegationTag = delegationData;
+            console.log('[WordPressAuth] Delegation tag added from WordPress:', delegationData);
           }
         } catch (e) {
-          console.debug('[WordPressAuth] Error parsing stored session');
+          console.warn('[WordPressAuth] Failed to parse delegation data:', e);
+        }
+
+        // Create temporary delegation-aware signer that doesn't use nos2x
+        const wpDelegationSigner = {
+          type: 'wordpress_delegation',
+          getPublicKey: async () => identity.delegation.delegatee,
+          signEvent: async (evt) => {
+            // Use WordPress delegation for signing
+            return await this.signEventWithWordPressDelegation(evt, identity.delegation);
+          }
+        };
+
+        // Temporarily override client signer
+        const originalSigner = client.signer;
+        client.signer = wpDelegationSigner;
+
+        try {
+          console.log('[WordPressAuth] Publishing via WordPress delegation signer');
+          const result = await client.publish(nostrEventData);
+          
+          if (result && result.signed) {
+            console.log('[WordPressAuth] Event published with WordPress delegation:', result.signed.id);
+            
+            // Verify delegation tag was included
+            const delegationTag = result.signed.tags?.find(tag => tag[0] === 'delegation');
+            if (delegationTag) {
+              console.log('[WordPressAuth] Delegation tag confirmed in published event:', delegationTag);
+            }
+            
+            return {
+              ok: true,
+              event: result.signed,
+              message: 'Event published with WordPress delegation'
+            };
+          } else {
+            throw new Error('No signed event returned from WordPress delegation');
+          }
+        } finally {
+          // Restore original signer
+          client.signer = originalSigner;
+        }
+        
+      } else {
+        console.log('[WordPressAuth] No delegation found - using standard nostr client');
+        
+        // Standard publishing ohne Delegation - nur hier client.login() verwenden
+        if (!client.signer) {
+          await client.login();
+        }
+        
+        const nostrEventData = {
+          title: eventData.title || '',
+          content: eventData.content || '',
+          start: this.convertToTimestamp(eventData.start),
+          end: this.convertToTimestamp(eventData.end),
+          location: eventData.location || '',
+          tags: this.parseEventTags(eventData),
+          status: 'planned',
+          summary: (eventData.content || eventData.title || '').substring(0, 100)
+        };
+
+        const result = await client.publish(nostrEventData);
+        
+        if (result && result.signed) {
+          return {
+            ok: true,
+            event: result.signed,
+            message: 'Event published via standard signing'
+          };
+        } else {
+          throw new Error('No signed event returned from standard signing');
         }
       }
-
-      const response = await fetch(apiUrl, fetchOptions);
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error('[WordPressAuth] Event creation failed:', response.status, errorText);
-        throw new Error(`Failed to create event: ${response.status} ${errorText}`);
-      }
-
-      const result = await response.json();
-
-      return {
-        ok: true,
-        event: result.event,
-        message: result.message || 'Event created successfully'
-      };
 
     } catch (error) {
       console.error('[WordPressAuth] Event creation error:', error);
       throw error;
+    }
+  }
+
+  /**
+   * Convert date string or timestamp to unix timestamp
+   */
+  convertToTimestamp(dateInput) {
+    if (!dateInput) return Math.floor(Date.now() / 1000);
+    
+    // If already a number (timestamp), return it
+    if (typeof dateInput === 'number') {
+      return Math.floor(dateInput);
+    }
+    
+    // If string, try to parse
+    if (typeof dateInput === 'string') {
+      const date = new Date(dateInput);
+      if (!isNaN(date.getTime())) {
+        return Math.floor(date.getTime() / 1000);
+      }
+    }
+    
+    // Fallback to current time
+    return Math.floor(Date.now() / 1000);
+  }
+
+  /**
+   * Parse event tags from various input formats
+   */
+  parseEventTags(eventData) {
+    const tags = [];
+    
+    // Handle tags array
+    if (Array.isArray(eventData.tags)) {
+      eventData.tags.forEach(tag => {
+        if (typeof tag === 'string' && tag.trim()) {
+          tags.push(tag.trim());
+        }
+      });
+    }
+    
+    // Handle categories string
+    if (typeof eventData.categories === 'string' && eventData.categories.trim()) {
+      eventData.categories.split(',').forEach(cat => {
+        const cleanCat = cat.trim();
+        if (cleanCat) {
+          tags.push(cleanCat);
+        }
+      });
+    }
+    
+    // Add WordPress-specific tags
+    tags.push('wordpress');
+    tags.push('wp-calendar');
+    
+    return tags;
+  }
+
+  /**
+   * ENHANCED: Get real delegation private key from WordPress with verification
+   */
+  async getDelegationPrivateKeyFromWordPress() {
+    try {
+      const wpSiteUrl = this.currentSession.site_url || this.currentSession.wp_site_url;
+      let apiUrl = `${wpSiteUrl}/wp-json/nostr-calendar/v1/delegation-private-key`;
+
+      // Add SSO token if available
+      const storedSession = localStorage.getItem('wp_sso_session');
+      if (storedSession) {
+        const sessionData = JSON.parse(storedSession);
+        if (sessionData.token && Date.now() / 1000 < sessionData.expires) {
+          apiUrl += `?sso_token=${encodeURIComponent(sessionData.token)}`;
+        }
+      }
+
+      console.log('[WordPressAuth] Requesting delegation private key from WordPress API');
+
+      const response = await fetch(apiUrl, {
+        method: 'GET',
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      });
+      
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error('[WordPressAuth] WordPress private key API failed:', response.status, errorText);
+        throw new Error(`WordPress private key API failed: ${response.status}`);
+      }
+
+      const result = await response.json();
+      console.log('[WordPressAuth] WordPress API response:', result);
+      
+      if (result.success && result.private_key) {
+        console.log('[WordPressAuth] Received real delegation private key from WordPress');
+        return result.private_key;
+      } else {
+        throw new Error(result.message || 'No private key returned from WordPress');
+      }
+      
+    } catch (error) {
+      console.error('[WordPressAuth] Failed to get delegation private key from WordPress:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Sign event using WordPress delegation with real private key from backend
+   */
+  async signEventWithWordPressDelegation(event, delegation) {
+    try {
+      console.log('[WordPressAuth] Signing event with REAL WordPress delegation key');
+      
+      // Load nostr-tools for local signing
+      const toolsModule = await import('https://esm.sh/nostr-tools@2.8.1/pure');
+      const tools = toolsModule;
+
+      // KRITISCH: Event muss mit dem Delegatee-Pubkey signiert werden
+      const targetPubkey = delegation.delegatee; // WordPress User Pubkey
+      
+      console.log('[WordPressAuth] Target pubkey for signing:', targetPubkey);
+
+      // REAL: Get actual delegation private key from WordPress backend
+      let realPrivateKey;
+      try {
+        realPrivateKey = await this.getDelegationPrivateKeyFromWordPress();
+        console.log('[WordPressAuth] Got private key from WordPress:', realPrivateKey ? 'YES' : 'NO');
+        
+        if (!realPrivateKey || typeof realPrivateKey !== 'string' || realPrivateKey.length !== 64) {
+          throw new Error('Invalid private key received from WordPress: ' + (typeof realPrivateKey) + ' length=' + (realPrivateKey?.length || 'undefined'));
+        }
+        
+        // CRITICAL: Verify the private key produces the expected pubkey
+        const privateKeyBytes = new Uint8Array(realPrivateKey.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
+        const derivedPubkey = tools.getPublicKey(privateKeyBytes);
+        
+        console.log('[WordPressAuth] Key verification:', {
+          expectedPubkey: targetPubkey,
+          derivedPubkey: derivedPubkey,
+          match: derivedPubkey === targetPubkey
+        });
+        
+        if (derivedPubkey !== targetPubkey) {
+          console.warn('[WordPressAuth] Private key does not produce expected pubkey, using fallback');
+          throw new Error('Private key mismatch');
+        }
+        
+        console.log('[WordPressAuth] Private key verification successful');
+        
+      } catch (error) {
+        console.warn('[WordPressAuth] Failed to get/verify real private key, using corrected fallback:', error);
+        // CORRECTED: Use the SAME algorithm as PHP backend
+        realPrivateKey = await this.generateMatchingPrivateKey(targetPubkey);
+      }
+      
+      // Convert hex string to bytes
+      let privateKeyBytes;
+      if (typeof realPrivateKey === 'string' && realPrivateKey.length === 64) {
+        privateKeyBytes = new Uint8Array(realPrivateKey.match(/.{1,2}/g).map(byte => parseInt(byte, 16)));
+      } else {
+        throw new Error('Invalid private key format: ' + typeof realPrivateKey + ' length=' + (realPrivateKey?.length || 'undefined'));
+      }
+
+      // FINAL VERIFICATION: Double-check the key produces the correct pubkey
+      const finalPubkey = tools.getPublicKey(privateKeyBytes);
+      if (finalPubkey !== targetPubkey) {
+        throw new Error(`Final pubkey verification failed: ${finalPubkey} !== ${targetPubkey}`);
+      }
+
+      // Ensure event has the correct pubkey before signing
+      if (!event.pubkey || event.pubkey !== targetPubkey) {
+        event.pubkey = targetPubkey;
+        console.log('[WordPressAuth] Set event pubkey to WordPress user:', targetPubkey);
+      }
+
+      // Generate event ID with correct pubkey
+      if (!event.id) {
+        try {
+          event.id = tools.getEventHash(event);
+          console.log('[WordPressAuth] Generated event ID with WordPress pubkey:', event.id);
+        } catch (e) {
+          console.warn('[WordPressAuth] Could not generate event ID:', e);
+        }
+      }
+
+      console.log('[WordPressAuth] Signing with verified WordPress delegation private key');
+
+      // Sign the event with the VERIFIED delegation private key
+      const signedEvent = tools.finalizeEvent(event, privateKeyBytes);
+      
+      // Final verification
+      if (signedEvent.pubkey !== targetPubkey) {
+        console.error('[WordPressAuth] FINAL VERIFICATION FAILED!', {
+          expected: targetPubkey,
+          actual: signedEvent.pubkey
+        });
+        throw new Error('Final signed event pubkey verification failed');
+      }
+      
+      console.log('[WordPressAuth] Event signed successfully with verified WordPress delegation:', {
+        id: signedEvent.id,
+        pubkey: signedEvent.pubkey,
+        kind: signedEvent.kind,
+        tags: signedEvent.tags.length,
+        delegationTag: signedEvent.tags.find(t => t[0] === 'delegation') ? 'PRESENT' : 'MISSING'
+      });
+      
+      return signedEvent;
+
+    } catch (error) {
+      console.error('[WordPressAuth] WordPress delegation signing failed:', error);
+      throw new Error('WordPress delegation signing failed: ' + error.message);
+    }
+  }
+
+  /**
+   * CORRECTED: Generate private key using EXACT same algorithm as PHP backend
+   */
+  async generateMatchingPrivateKey(targetPubkey) {
+    const session = await this.getSession();
+    const userId = session?.user?.id;
+    const siteUrl = session?.site_url || session?.wp_site_url;
+    
+    if (!userId || !siteUrl) {
+      throw new Error('Cannot generate key without user ID and site URL');
+    }
+
+    // Load nostr-tools
+    const toolsModule = await import('https://esm.sh/nostr-tools@2.8.1/pure');
+    const tools = toolsModule;
+
+    // EXACTLY match PHP backend: "wp-user-private-{$userId}-" . get_site_url()
+    const seed = `wp-user-private-${userId}-${siteUrl}`;
+    
+    console.log('[WordPressAuth] Using EXACT PHP algorithm with seed:', seed);
+    
+    // Use same SHA-256 as PHP hash('sha256', $seed)
+    const encoder = new TextEncoder();
+    const data = encoder.encode(seed);
+    const digest = await crypto.subtle.digest('SHA-256', data);
+    const privateKeyBytes = new Uint8Array(digest);
+    
+    // Convert to hex string (like PHP)
+    const privateKeyHex = Array.from(privateKeyBytes).map(b => b.toString(16).padStart(2, '0')).join('');
+    
+    // Verify this produces the target pubkey
+    const derivedPubkey = tools.getPublicKey(privateKeyBytes);
+    
+    console.log('[WordPressAuth] Generated key verification:', {
+      seed: seed,
+      privateKeyHex: privateKeyHex.substring(0, 16) + '...',
+      derivedPubkey: derivedPubkey,
+      targetPubkey: targetPubkey,
+      match: derivedPubkey === targetPubkey
+    });
+    
+    if (derivedPubkey === targetPubkey) {
+      console.log('[WordPressAuth] SUCCESS: Generated matching private key');
+      return privateKeyHex;
+    } else {
+      throw new Error(`Generated private key does not produce target pubkey: ${derivedPubkey} !== ${targetPubkey}`);
     }
   }
 
@@ -308,56 +662,56 @@ export class WordPressAuthPlugin extends AuthPluginInterface {
     }
   }
 
-  async getEvents() {
-    if (!await this.isLoggedIn()) {
-      throw new Error('Not logged in to WordPress SSO');
-    }
+  // async getEvents() { 
+  //   if (!await this.isLoggedIn()) {
+  //     throw new Error('Not logged in to WordPress SSO');
+  //   }
 
-    try {
-      // Get the WordPress site URL from session
-      const wpSiteUrl = this.currentSession?.site_url || this.currentSession?.wp_site_url || this.wpSiteUrl;
-      let apiUrl = `${wpSiteUrl}/wp-json/nostr-calendar/v1/events`;
+  //   try {
+  //     // Get the WordPress site URL from session
+  //     const wpSiteUrl = this.currentSession?.site_url || this.currentSession?.wp_site_url || this.wpSiteUrl;
+  //     let apiUrl = `${wpSiteUrl}/wp-json/nostr-calendar/v1/events`;
 
-      // Add SSO token to request if available
-      const fetchOptions = {
-        method: 'GET',
-        headers: {
-          'Content-Type': 'application/json'
-        }
-      };
+  //     // Add SSO token to request if available
+  //     const fetchOptions = {
+  //       method: 'GET',
+  //       headers: {
+  //         'Content-Type': 'application/json'
+  //       }
+  //     };
 
-      // Try to use SSO token for authentication
-      const storedSession = localStorage.getItem('wp_sso_session');
-      if (storedSession) {
-        try {
-          const sessionData = JSON.parse(storedSession);
-          if (sessionData.token && Date.now() / 1000 < sessionData.expires) {
-            apiUrl += `?sso_token=${encodeURIComponent(sessionData.token)}`;
-          }
-        } catch (e) {
-          console.debug('[WordPressAuth] Error parsing stored session');
-        }
-      }
+  //     // Try to use SSO token for authentication
+  //     const storedSession = localStorage.getItem('wp_sso_session');
+  //     if (storedSession) {
+  //       try {
+  //         const sessionData = JSON.parse(storedSession);
+  //         if (sessionData.token && Date.now() / 1000 < sessionData.expires) {
+  //           apiUrl += `?sso_token=${encodeURIComponent(sessionData.token)}`;
+  //         }
+  //       } catch (e) {
+  //         console.debug('[WordPressAuth] Error parsing stored session');
+  //       }
+  //     }
 
-      const response = await fetch(apiUrl, fetchOptions);
+  //     const response = await fetch(apiUrl, fetchOptions);
 
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error('[WordPressAuth] Getting events failed:', response.status, errorText);
-        throw new Error(`Failed to get events: ${response.status} ${errorText}`);
-      }
+  //     if (!response.ok) {
+  //       const errorText = await response.text();
+  //       console.error('[WordPressAuth] Getting events failed:', response.status, errorText);
+  //       throw new Error(`Failed to get events: ${response.status} ${errorText}`);
+  //     }
 
-      const result = await response.json();
+  //     const result = await response.json();
 
-      // Convert WordPress events to the format expected by the calendar
-      const events = result.events ? Object.values(result.events) : [];
-      return events;
+  //     // Convert WordPress events to the format expected by the calendar
+  //     const events = result.events ? Object.values(result.events) : [];
+  //     return events;
 
-    } catch (error) {
-      console.error('[WordPressAuth] Get events error:', error);
-      throw error;
-    }
-  }
+  //   } catch (error) {
+  //     console.error('[WordPressAuth] Get events error:', error);
+  //     throw error;
+  //   }
+  // }
 
   async updateAuthUI(elements) {
     const { whoami, btnLogin, btnLogout, btnNew, btnLoginMenu } = elements;

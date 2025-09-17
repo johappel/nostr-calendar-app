@@ -266,6 +266,31 @@ export class AuthManager {
       if (window.nostrCalendarWP && window.nostrCalendarWP.apiUrl) {
         return true;
       }
+
+      // Check for WordPress SSO session in localStorage
+      try {
+        const wpSession = localStorage.getItem('wp_sso_session');
+        if (wpSession) {
+          const session = JSON.parse(wpSession);
+          if (session.site_url && Date.now() / 1000 < session.expires) {
+            console.log('[AuthManager] WordPress SSO session found in localStorage');
+            return true;
+          }
+        }
+      } catch (e) {
+        console.debug('[AuthManager] Error checking WordPress session:', e);
+      }
+
+      // Check if we're on a WordPress site by looking for typical WordPress indicators
+      const isWordPressSite = window.location.href.includes('/wp-') || 
+                             window.location.href.includes('wordpress') ||
+                             document.querySelector('meta[name="generator"]')?.content.includes('WordPress') ||
+                             document.querySelector('link[href*="wp-content"]') !== null;
+      
+      if (isWordPressSite) {
+        console.log('[AuthManager] WordPress environment detected');
+        return true;
+      }
     }
     
     return false;
