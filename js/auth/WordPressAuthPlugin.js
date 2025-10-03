@@ -103,35 +103,15 @@ export class WordPressAuthPlugin extends AuthPluginInterface {
     const logoutUrl = window.NostrSignerConfig?.logoutUrl || '/wp-login.php?action=logout';
     window.location.href = logoutUrl;
   }
-  // ---- Event-Vorlage (Kind 31923)
-  toEventTemplate(data) {
-    const tags = [
-      ['title', data.title],
-      ['start', String(data.start)],
-      ['end', String(data.end)],
-      ['status', data.status || 'planned'],
-    ];
-    if (data.summary) tags.push(['summary', data.summary]);
-    if (data.location) tags.push(['location', data.location]);
-    if (data.image) tags.push(['image', data.image]);
-    for (const t of (data.tags || [])) { const v = String(t).trim(); if (v) tags.push(['t', v]); }
-    const d = data.d || b64((data.url || '') + '|' + data.title + '|' + data.start);
-    tags.push(['d', d]);
-    return { evt: { kind: 31923, created_at: Math.floor(Date.now() / 1000), tags, content: data.content || '' }, d };
-  }
-  
-
   async createEvent(eventData) {
     if (!await this.isLoggedIn()) {
       throw new Error('Nicht bei WordPress SSO angemeldet');
     }
     try {
-      // NIP-52 Event formatieren (kind 31923)
-      const { evt, d } = this.toEventTemplate(eventData);
-      console.debug('[WordPressAuth] sending event to:', evt, window.NostrSignerConfig?.defaultRelays || ['wss://relay.damus.io']) ;
-      // WordPress-Signierung über nostr-app.js 
+      console.debug('[WordPressAuth] sending event to:', eventData, window.NostrSignerConfig?.defaultRelays || ['wss://relay.damus.io']) ;
+      // WordPress-Signierung über nostr-app.js
       const result = await window.WP_NostrTools.nostr_send(
-        evt,
+        eventData,
         'user', // WordPress-Benutzer-Schlüssel
         window.NostrSignerConfig?.defaultRelays || ['wss://relay.damus.io'],
         {

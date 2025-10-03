@@ -133,7 +133,44 @@ export class NostrAuthPlugin extends AuthPluginInterface {
     }
 
     console.log('[NostrAuth] Creating event via Nostr client');
-    return await this.client.publish(eventData);
+    
+    // If eventData is already a formatted event (has kind, tags, etc.), use it directly
+    // Otherwise, use the client.publish method which will format it
+    if (eventData && eventData.kind && eventData.tags) {
+      // Already formatted event, just sign and publish
+      await this.client.initPool();
+      const signed = await this.client.signer.signEvent(eventData);
+      
+      // Publish to relays
+      const { Config } = await import('../config.js');
+      const pubs = this.client.pool.publish(Config.relays, signed);
+      
+      if (Array.isArray(pubs)) {
+        const timeout = 3000;
+        const promises = pubs.map(pub => {
+          if (!pub || typeof pub.on !== 'function') return Promise.resolve();
+          return new Promise(resolve => {
+            const timer = setTimeout(() => resolve(), timeout);
+            const onOk = () => { clearTimeout(timer); resolve(true); };
+            const onFailed = () => { clearTimeout(timer); resolve(false); };
+            try {
+              pub.on('ok', onOk);
+              pub.on('failed', onFailed);
+            } catch (e) {
+              clearTimeout(timer);
+              resolve();
+            }
+          });
+        });
+        await Promise.race(promises);
+        await Promise.allSettled(promises);
+      }
+      
+      return { signed };
+    } else {
+      // Raw event data, let client.publish handle formatting
+      return await this.client.publish(eventData);
+    }
   }
 
   async deleteEvent(eventId) {

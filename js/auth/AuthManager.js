@@ -3,6 +3,8 @@
 
 import { authRegistry } from './AuthPluginInterface.js';
 import { NostrAuthPlugin } from './NostrAuthPlugin.js';
+import { b64 } from '../utils.js';
+import { Config } from '../config.js';
 
 export class AuthManager {
   constructor(config = {}) {
@@ -123,7 +125,12 @@ export class AuthManager {
       throw new Error('No authentication plugin active');
     }
 
-    return await plugin.createEvent(eventData);
+    // Use the centralized toEventTemplate to create the event structure
+    const { evt } = this.toEventTemplate(eventData);
+    
+    // Let the plugin handle the actual signing and publishing
+    // Pass the formatted event to all plugins
+    return await plugin.createEvent(evt);
   }
 
   /**
@@ -342,6 +349,47 @@ export class AuthManager {
     
     this.currentPlugin = null;
     this.changeCallbacks = [];
+  }
+
+  /**
+   * Create an event template for calendar events (Kind 31923)
+   * @param {Object} data - Event data
+   * @returns {Object} Event template with evt and d properties
+   */
+  toEventTemplate(data) {
+    const tags = [
+      ['title', data.title],
+      ['start', String(data.start)],
+      ['end', String(data.end)],
+      ['status', data.status || 'planned'],
+    ];
+    if (data.summary) tags.push(['summary', data.summary]);
+    if (data.location) tags.push(['location', data.location]);
+    if (data.image) tags.push(['image', data.image]);
+    
+    // Handle tags array properly - ensure each tag is a string
+    if (Array.isArray(data.tags)) {
+      for (const t of data.tags) {
+        const v = String(t).trim();
+        if (v) tags.push(['t', v]);
+      }
+    }
+    
+    const d = data.d || b64((data.url || '') + '|' + data.title + '|' + data.start);
+    tags.push(['d', d]);
+    
+    // Add app tag if available (imported from utils)
+    if (Array.isArray(Config.appTag)) tags.push(Config.appTag);
+    
+    return {
+      evt: {
+        kind: 31923,
+        created_at: Math.floor(Date.now() / 1000),
+        tags,
+        content: data.content || ''
+      },
+      d
+    };
   }
 }
 

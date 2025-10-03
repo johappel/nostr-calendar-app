@@ -284,24 +284,6 @@ export class NostrClient {
 
 
 
-  // ---- Event-Vorlage (Kind 31923)
-  toEventTemplate(data) {
-    const tags = [
-      ['title', data.title],
-      ['start', String(data.start)],
-      ['end', String(data.end)],
-      ['status', data.status || 'planned'],
-    ];
-    if (data.summary) tags.push(['summary', data.summary]);
-    if (data.location) tags.push(['location', data.location]);
-    if (data.image) tags.push(['image', data.image]);
-    for (const t of (data.tags || [])) { const v = String(t).trim(); if (v) tags.push(['t', v]); }
-    const d = data.d || b64((data.url || '') + '|' + data.title + '|' + data.start);
-    tags.push(['d', d]);
-    if (Array.isArray(Config.appTag)) tags.push(Config.appTag);
-    return { evt: { kind: 31923, created_at: Math.floor(Date.now() / 1000), tags, content: data.content || '' }, d };
-  }
-
   // ---- Diagnostics: probe signing capabilities for current signer
   async _diagSign(kind) {
     return diagSign(kind, (evt, timeout) => this.signEventWithTimeout(evt, timeout));
@@ -312,7 +294,10 @@ export class NostrClient {
     if (!this.signer) await this.login();
     await this.initPool();
     await loadTools();
-    const { evt } = this.toEventTemplate(data);
+    
+    // Import AuthManager to use the centralized toEventTemplate
+    const { authManager } = await import('./auth/AuthManager.js');
+    const { evt } = authManager.toEventTemplate(data);
     const signed = await this.signer.signEvent(evt);
   
     // publish zu allen Relays; robust gegenüber verschiedenen pool-APIs und
