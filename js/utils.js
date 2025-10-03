@@ -22,7 +22,7 @@ export function uid(len=8){
   return Math.random().toString(36).slice(2,2+len);
 }
 export function b64(str){
-  return btoa(unescape(encodeURIComponent(str)));
+  return btoa(decodeURI(encodeURIComponent(str)));
 }
 export function unb64(str){
   try { return decodeURIComponent(escape(atob(str))); } catch(e){ return str; }

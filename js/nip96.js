@@ -8,7 +8,7 @@ async function sha256Hex(blob){
   return arr.map(b=>b.toString(16).padStart(2,'0')).join('');
 }
 function b64json(obj){
-  return btoa(unescape(encodeURIComponent(JSON.stringify(obj))));
+  return btoa(decodeURI(encodeURIComponent(JSON.stringify(obj))));
 }
 
 export async function signHttpAuth({ signer, method, url, payloadSha256='' }){
