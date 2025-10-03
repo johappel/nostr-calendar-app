@@ -19,6 +19,7 @@ export const Config = {
     },
     contactsKind: 3 // Fallback: NIP-02 Contacts (nicht empfohlen zum Schreiben)
   },
+
   defaultTheme: 'light',
   // Optionaler NIP-96 Upload-Endpunkt (z. B. https://media.server/api/upload )
   mediaUploadEndpoint: '',
